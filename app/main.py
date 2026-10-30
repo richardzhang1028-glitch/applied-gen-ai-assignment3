@@ -4,6 +4,7 @@ from functools import lru_cache
 
 import spacy
 from fastapi import FastAPI, HTTPException, File, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.bigram_model import BigramModel
@@ -16,6 +17,7 @@ from PIL import Image
 from torchvision import transforms
 
 from app.cnn_model import AssignmentCNN
+from app.gan_model import Generator
 
 app = FastAPI(
     title="Applied Generative AI API",
@@ -36,6 +38,21 @@ classifier.load_state_dict(checkpoint["model_state_dict"])
 classifier.eval()
 
 class_names = checkpoint["classes"]
+GAN_MODEL_PATH = Path(__file__).resolve().parent.parent / "mnist_gan_generator.pth"
+
+gan_checkpoint = torch.load(
+    GAN_MODEL_PATH,
+    map_location=device,
+    weights_only=True,
+)
+
+gan_generator = Generator(
+    latent_dim=gan_checkpoint["latent_dim"]
+).to(device)
+
+gan_generator.load_state_dict(gan_checkpoint["generator_state_dict"])
+gan_generator.eval()
+gan_latent_dim = gan_checkpoint["latent_dim"]
 
 image_transform = transforms.Compose([
     transforms.Resize((64, 64)),
@@ -142,3 +159,19 @@ async def classify_image(file: UploadFile = File(...)):
         "class": class_names[predicted_index],
         "confidence": float(probabilities[predicted_index]),
     }
+@app.get("/generate-digit")
+def generate_digit():
+    noise = torch.randn(1, gan_latent_dim, device=device)
+
+    with torch.inference_mode():
+        generated = gan_generator(noise)[0, 0]
+
+    generated = (generated.clamp(-1, 1) + 1) / 2
+    image_array = (generated.cpu().numpy() * 255).astype("uint8")
+    image = Image.fromarray(image_array)
+
+    image_buffer = io.BytesIO()
+    image.save(image_buffer, format="PNG")
+    image_buffer.seek(0)
+
+    return StreamingResponse(image_buffer, media_type="image/png")
